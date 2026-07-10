@@ -1,0 +1,5 @@
+# Thin key-provider with a pluggable storage adapter
+
+The pool is a **thin key-provider**, not a wrapper around ElevenLabs' generation API: it selects an Account that still has Quota, hands back that Account's Key, and tracks credit balances — but the consumer makes the actual ElevenLabs call. This keeps the pool decoupled from ElevenLabs' evolving SDK/endpoints and trivially testable, at the cost of the consumer having to report what a Generation cost (see ADR-0002).
+
+State lives behind a **pluggable storage adapter** — a small interface (atomic reserve / commit / release / read-and-refresh) with an **in-memory adapter shipped as the default**. This is the only shape that is correct across both deployment targets we care about: a single long-lived process (in-memory is fine) and Next.js/serverless with concurrent invocations (which needs a shared store like Redis/Upstash/KV with atomic decrements). We considered hard-coding in-memory state, but that silently overspends accounts under concurrency; we considered mandating an external store, but that burdens single-process users. The adapter defers the topology choice to the consumer without changing pool logic.
