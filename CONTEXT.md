@@ -12,6 +12,10 @@ _Avoid_: Subscription, key (as the unit of tracking)
 The API credential belonging to an Account, handed to the consumer to authenticate a Generation. Just the thing you hand out — never the unit of quota.
 _Avoid_: Token, credential
 
+**KeyLease**:
+What `acquire()` hands back: the selected Account's Key together with the handles that close out the Reservation taken for it — `commit(actualCredits)`, `release()`, and `reportInvalid()`. The Key alone can't reference its Reservation safely when concurrent callers hold different Reservations on the same Account, so the lease binds the two. Read `.key` for the ElevenLabs client. (Supersedes the earlier "acquire returns a bare Key string" intent; see ADR-0002.)
+_Avoid_: Ticket, handle, token
+
 **Credit**:
 The unit of ElevenLabs quota. Cost per input character depends on the model: standard models (v1/v2 multilingual) = 1 credit/char; Flash/Turbo = 0.5 credits/char. Formerly called "characters" (same value, renamed). The Get User Subscription endpoint still exposes credits under legacy `character_*` field names — read those, but treat the values as credits.
 _Avoid_: Character (as the balance unit)
