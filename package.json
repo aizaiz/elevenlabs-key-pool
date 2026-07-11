@@ -1,6 +1,6 @@
 {
-  "name": "elevenlabs-key-pool",
-  "version": "0.0.0",
+  "name": "@aizaiz/elevenlabs-key-pool",
+  "version": "0.1.0",
   "description": "Spread ElevenLabs usage across multiple subscription accounts, handing back a key from an account that still has quota.",
   "type": "module",
   "main": "./dist/index.js",
@@ -14,12 +14,14 @@
   "files": [
     "dist"
   ],
+  "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "keywords": [
     "elevenlabs",
@@ -29,6 +31,17 @@
     "credits"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aizaiz/elevenlabs-key-pool.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aizaiz/elevenlabs-key-pool/issues"
+  },
+  "homepage": "https://github.com/aizaiz/elevenlabs-key-pool#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18"
   },
