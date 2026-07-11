@@ -272,6 +272,34 @@ describe('createPool sync & drift correction', () => {
     expect(calls['key-a']).toBe(1);
   });
 
+  it('keeps a live Reservation counted against a freshly-Synced true balance (no double-count, no drop)', async () => {
+    let now = 1_000_000;
+    // Seed reports remaining 1000; the later Sync reports a true remaining of 900.
+    const { fetcher } = countingFetcher((_key, call) =>
+      call === 1 ? sub(1000, 0) : sub(1000, 100),
+    );
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: () => now,
+      stalenessTtl: 60_000,
+      leaseTtl: 10_000_000, // long, so advancing past staleness doesn't expire R1
+    });
+
+    await pool.acquire(300); // seeds a (remaining 1000); R1 holds 300 -> available 700
+    now += 60_001; // snapshot is now stale, forcing a re-Sync on the next acquire
+
+    // The re-Sync swaps the true remaining to 900. R1 must still be subtracted,
+    // so available = 900 - 300 = 600 and this 600 fits exactly. Were R1
+    // double-counted, availability would be 300 and this would fail.
+    expect((await pool.acquire(600)).key).toBe('key-a'); // R2 holds 600
+
+    // a now holds R1(300) + R2(600) = 900 against remaining 900 -> available 0.
+    // Were R1 dropped on the Sync, availability would be 900 - 600 = 300 and
+    // this 1-Credit acquire would succeed; its rejection proves R1 survived.
+    await expect(pool.acquire(1)).rejects.toBeInstanceOf(AllAccountsExhausted);
+  });
+
   it('sync() warms snapshots explicitly, off the acquire path', async () => {
     const { fetcher, calls } = countingFetcher(() => sub(1000));
     const pool = createPool({
