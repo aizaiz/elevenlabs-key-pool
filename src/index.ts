@@ -10,7 +10,7 @@ export type {
 } from './types.js';
 export { InMemoryStorageAdapter } from './adapters/memory.js';
 export type { InMemoryStorageAdapterOptions } from './adapters/memory.js';
-export { AllAccountsExhausted } from './errors.js';
+export { AllAccountsExhausted, InvalidKeyError, isAuthError } from './errors.js';
 export {
   createPool,
   Pool,

@@ -112,6 +112,13 @@ export interface KeyLease {
    * charged nothing, restoring the Account's available Credits.
    */
   release(): Promise<void>;
+  /**
+   * Report that this Key was rejected as invalid or revoked (a 401/403 from the
+   * Generation call): Quarantine the Account so it's removed from selection and
+   * the operator is notified, and refund the Reservation (the Generation
+   * charged nothing). The pool keeps serving from healthy Accounts.
+   */
+  reportInvalid(): Promise<void>;
 }
 
 /**

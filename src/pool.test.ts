@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { createPool } from './pool.js';
-import { AllAccountsExhausted } from './errors.js';
+import { AllAccountsExhausted, InvalidKeyError } from './errors.js';
 import type { Subscription, SubscriptionFetcher } from './types.js';
+
+/** An `Error` carrying an HTTP `status`, as a real HTTP client would surface a 401/403. */
+function httpError(status: number): Error {
+  return Object.assign(new Error(`HTTP ${status}`), { status });
+}
 
 /** A Subscription with `limit` Credits, `used` already spent, and a reset time. */
 function sub(limit: number, used = 0, resetUnixSeconds = 0): Subscription {
@@ -329,6 +334,81 @@ describe('createPool sync & drift correction', () => {
 
     // a can't be seeded, so selection falls through to the healthy b.
     expect((await pool.acquire(100)).key).toBe('key-b');
+  });
+});
+
+describe('createPool quarantine', () => {
+  it('Quarantines an Account on a 401/403 during Sync and keeps serving healthy Accounts', async () => {
+    const quarantined: string[] = [];
+    const { fetcher, calls } = countingFetcher((key) => {
+      if (key === 'key-a') throw httpError(401); // a's Key is revoked
+      return sub(1000);
+    });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+      sleep: noSleep,
+      onQuarantine: (id) => quarantined.push(id),
+    });
+
+    // a can't be Synced (401), so it's Quarantined and selection serves b.
+    expect((await pool.acquire(100)).key).toBe('key-b');
+    expect(quarantined).toEqual(['a']);
+    // An auth error is not retried, so a was fetched exactly once.
+    expect(calls['key-a']).toBe(1);
+
+    // a stays out of selection on the next acquire, with no further fetch.
+    expect((await pool.acquire(100)).key).toBe('key-b');
+    expect(calls['key-a']).toBe(1);
+  });
+
+  it('Quarantines an Account when the consumer reports the Key invalid via the lease', async () => {
+    const quarantined: string[] = [];
+    const { fetcher } = fakeFetcher({ 'key-a': sub(1000), 'key-b': sub(1000) });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+      onQuarantine: (id) => quarantined.push(id),
+    });
+
+    const lease = await pool.acquire(100); // key-a
+    await lease.reportInvalid(); // consumer saw a 401 from the Generation call
+
+    expect(quarantined).toEqual(['a']);
+    // a is removed from selection; the pool serves the healthy b.
+    expect((await pool.acquire(100)).key).toBe('key-b');
+  });
+
+  it('rejoins a Quarantined Account after a successful Sync', async () => {
+    // a's Key fails auth on the first fetch, then works (a transient blip).
+    const { fetcher } = countingFetcher((key, call) => {
+      if (key === 'key-a' && call === 1) throw new InvalidKeyError();
+      return sub(1000);
+    });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+      sleep: noSleep,
+    });
+
+    expect((await pool.acquire(100)).key).toBe('key-b'); // a Quarantined
+
+    await pool.sync('a'); // operator re-Syncs; this time it succeeds
+
+    // a has rejoined selection and, being highest-Priority, is chosen again.
+    expect((await pool.acquire(100)).key).toBe('key-a');
   });
 });
 

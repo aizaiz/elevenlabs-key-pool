@@ -1,5 +1,5 @@
 import { InMemoryStorageAdapter } from './adapters/memory.js';
-import { AllAccountsExhausted } from './errors.js';
+import { AllAccountsExhausted, isAuthError } from './errors.js';
 import type {
   AccountConfig,
   AccountSnapshot,
@@ -111,6 +111,12 @@ export interface PoolConfig {
    * throw {@link AllAccountsExhausted} instead. Must name a registered Account.
    */
   readonly overflowAccountId?: string;
+  /**
+   * Called when an Account is Quarantined (its Key was found invalid/revoked),
+   * so the operator can fix or replace the Key. Fires once per Quarantine with
+   * the affected Account id.
+   */
+  readonly onQuarantine?: (accountId: string) => void;
 }
 
 /**
@@ -134,6 +140,10 @@ export class Pool {
   readonly #syncBackoff: number;
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #overflowAccountId: string | undefined;
+  readonly #onQuarantine: ((accountId: string) => void) | undefined;
+
+  /** Ids of Accounts Quarantined for a bad Key; skipped until a successful Sync. */
+  readonly #quarantined = new Set<string>();
 
   /** Accounts by id, for {@link Pool.sync} of a single Account. */
   readonly #accountsById = new Map<string, AccountConfig>();
@@ -186,6 +196,7 @@ export class Pool {
       throw new Error(`Unknown overflow Account id: ${config.overflowAccountId}`);
     }
     this.#overflowAccountId = config.overflowAccountId;
+    this.#onQuarantine = config.onQuarantine;
   }
 
   /**
@@ -209,25 +220,31 @@ export class Pool {
       if (account.id === this.#overflowAccountId) {
         continue;
       }
+      // A Quarantined Account's Key is known-bad; skip it (a successful Sync
+      // rejoins it) without a refresh, so it can't be selected.
+      if (this.#quarantined.has(account.id)) {
+        continue;
+      }
       // Refresh drift before selecting: seed on first use, apply a due Quota
       // reset, and lazily/forcibly Sync. A failed refresh keeps the last-known
       // snapshot; only an unseeded Account with a down fetcher is skipped.
       const snapshot = await this.#ensureFresh(account);
-      if (!snapshot) {
+      // ensureFresh may have just Quarantined this Account (auth error on Sync).
+      if (!snapshot || this.#quarantined.has(account.id)) {
         continue;
       }
       const reservation = await this.#storage.reserve(account.id, credits, this.#leaseTtl);
       if (reservation) {
-        return this.#lease(account.key, reservation.id);
+        return this.#lease(account, reservation.id);
       }
     }
 
     // Every non-overflow Account is exhausted. Fall back to the overflow
-    // Account if one is configured, letting it run into Overage.
-    if (this.#overflowAccountId !== undefined) {
+    // Account if one is configured and healthy, letting it run into Overage.
+    if (this.#overflowAccountId !== undefined && !this.#quarantined.has(this.#overflowAccountId)) {
       const overflow = this.#accountsById.get(this.#overflowAccountId)!;
       const snapshot = await this.#ensureFresh(overflow);
-      if (snapshot) {
+      if (snapshot && !this.#quarantined.has(overflow.id)) {
         const reservation = await this.#storage.reserve(
           overflow.id,
           credits,
@@ -235,7 +252,7 @@ export class Pool {
           true, // allow Overage: the overflow Account's explicit opt-in
         );
         if (reservation) {
-          return this.#lease(overflow.key, reservation.id);
+          return this.#lease(overflow, reservation.id);
         }
       }
     }
@@ -266,13 +283,32 @@ export class Pool {
   }
 
   /** Wrap a Reservation as a {@link KeyLease} bound to its commit/release. */
-  #lease(key: string, reservationId: string): KeyLease {
+  #lease(account: AccountConfig, reservationId: string): KeyLease {
     const storage = this.#storage;
     return {
-      key,
+      key: account.key,
       commit: (actualCredits) => storage.commit(reservationId, actualCredits),
       release: () => storage.release(reservationId),
+      reportInvalid: async () => {
+        // A 401/403 means the Generation charged nothing: refund the hold, then
+        // Quarantine the Account so it's removed from selection.
+        await storage.release(reservationId);
+        this.#quarantine(account.id);
+      },
     };
+  }
+
+  /**
+   * Remove an Account from selection because its Key is invalid/revoked, firing
+   * the {@link PoolConfig.onQuarantine} callback once. A subsequent successful
+   * Sync rejoins it.
+   */
+  #quarantine(accountId: string): void {
+    if (this.#quarantined.has(accountId)) {
+      return;
+    }
+    this.#quarantined.add(accountId);
+    this.#onQuarantine?.(accountId);
   }
 
   /**
@@ -345,20 +381,31 @@ export class Pool {
     try {
       const subscription = await this.#fetchWithRetry(account.key);
       await this.#storage.writeSnapshot(account.id, this.#toSnapshot(subscription));
+      // A successful Sync clears any Quarantine: a transient auth blip doesn't
+      // permanently cost an Account.
+      this.#quarantined.delete(account.id);
       return true;
-    } catch {
+    } catch (error) {
+      if (isAuthError(error)) {
+        // The Key is invalid/revoked — Quarantine rather than keep retrying it.
+        this.#quarantine(account.id);
+      }
       // Keep the last-known snapshot; selection proceeds on stale-but-usable data.
       return false;
     }
   }
 
-  /** Fetch a Subscription, retrying with exponential backoff on failure. */
+  /**
+   * Fetch a Subscription, retrying with exponential backoff on failure. An auth
+   * error (401/403) is thrown immediately without retry — a bad Key won't fix
+   * itself, and {@link #doSync} turns it into a Quarantine.
+   */
   async #fetchWithRetry(key: string): Promise<Subscription> {
     for (let attempt = 0; ; attempt++) {
       try {
         return await this.#fetcher(key);
       } catch (error) {
-        if (attempt >= this.#syncRetries) {
+        if (isAuthError(error) || attempt >= this.#syncRetries) {
           throw error;
         }
         await this.#sleep(this.#syncBackoff * 2 ** attempt);
