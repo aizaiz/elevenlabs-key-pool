@@ -49,6 +49,40 @@ export interface Reservation {
 }
 
 /**
+ * The raw Get User Subscription payload the pool reads to seed and Sync an
+ * Account. ElevenLabs exposes the balance under legacy `character_*` field
+ * names, but the values are Credits (see CONTEXT.md); converting these into an
+ * {@link AccountSnapshot} is the pool's job.
+ *
+ * Only the fields the pool depends on are modelled; the endpoint returns more.
+ */
+export interface Subscription {
+  /** Credits consumed so far this billing period. */
+  readonly character_count: number;
+  /** The Account's Credit allowance for the billing period. */
+  readonly character_limit: number;
+  /** Unix **seconds** at which the Quota resets. */
+  readonly next_character_count_reset_unix: number;
+}
+
+/**
+ * Fetches an Account's live {@link Subscription} from ElevenLabs, given its Key.
+ *
+ * Injected so tests can substitute a fake that returns controlled balances
+ * without a network call (see ADR-0001). A real ElevenLabs default is shipped
+ * with the Sync work; until then the fetcher must be supplied.
+ */
+export type SubscriptionFetcher = (key: string) => Promise<Subscription>;
+
+/**
+ * Returns the current time as Unix milliseconds.
+ *
+ * Injected so tests can advance time deterministically for staleness, lease
+ * expiry, and Quota-reset boundaries. Defaults to {@link Date.now}.
+ */
+export type Clock = () => number;
+
+/**
  * The storage seam behind the pool. It owns the atomic Credit operations, which
  * is what keeps selection correct under concurrency and across process
  * boundaries.
