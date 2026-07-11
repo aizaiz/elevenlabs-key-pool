@@ -28,8 +28,24 @@ function fakeFetcher(byKey: Record<string, Subscription>) {
   return { fetcher, calls };
 }
 
+/**
+ * A fetcher that counts calls per Key and delegates to `impl` (which may throw
+ * to simulate a failed Sync). Lets a test assert Sync/retry behaviour.
+ */
+function countingFetcher(impl: (key: string, call: number) => Subscription) {
+  const calls: Record<string, number> = {};
+  const fetcher: SubscriptionFetcher = async (key) => {
+    calls[key] = (calls[key] ?? 0) + 1;
+    return impl(key, calls[key]);
+  };
+  return { fetcher, calls };
+}
+
 /** A clock frozen at a fixed instant; enough for the seed/acquire path. */
 const fixedClock = () => 1_000_000;
+
+/** A no-op sleep so Sync-retry backoff doesn't add real delay in tests. */
+const noSleep = async () => {};
 
 describe('createPool acquire()', () => {
   it('returns the highest-Priority Account with room as a KeyLease', async () => {
@@ -172,6 +188,146 @@ describe('createPool acquire()', () => {
         clock: fixedClock,
       }),
     ).toThrow(/duplicate/i);
+  });
+});
+
+describe('createPool sync & drift correction', () => {
+  it('re-Syncs a snapshot older than the staleness TTL before selecting', async () => {
+    let now = 1_000_000;
+    // 500 remaining on the first Sync, refilled to 900 on the next.
+    const { fetcher, calls } = countingFetcher((_key, call) =>
+      call === 1 ? sub(1000, 500) : sub(1000, 100),
+    );
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: () => now,
+      stalenessTtl: 60_000,
+    });
+
+    await pool.acquire(400); // seeds a: remaining 500, holds 400
+    expect(calls['key-a']).toBe(1);
+
+    now += 60_001; // snapshot is now stale
+    await pool.acquire(600); // triggers a re-Sync to remaining 900 first
+
+    // Re-Synced (call 2), and the fresh 900 remaining fit the 600 acquire.
+    expect(calls['key-a']).toBe(2);
+  });
+
+  it('does not re-Sync a snapshot within the staleness TTL', async () => {
+    let now = 1_000_000;
+    const { fetcher, calls } = countingFetcher(() => sub(1000));
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: () => now,
+      stalenessTtl: 60_000,
+    });
+
+    await pool.acquire(100);
+    now += 59_999; // still fresh
+    await pool.acquire(100);
+
+    expect(calls['key-a']).toBe(1);
+  });
+
+  it('forces a Sync when an Account is near its limit, regardless of TTL', async () => {
+    const { fetcher, calls } = countingFetcher(() => sub(1000, 950)); // remaining 50
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: fixedClock, // never stale
+      nearLimitThreshold: 0.1, // near limit at <= 100 remaining
+    });
+
+    await pool.acquire(10); // seeds a: remaining 50 (near limit)
+    await pool.acquire(10); // near limit forces a Sync despite a fresh snapshot
+
+    expect(calls['key-a']).toBe(2);
+  });
+
+  it('resets local remaining to full Quota once the reset time has passed', async () => {
+    let now = 1_000_000;
+    // remaining 200, resets at unix second 2000 -> 2_000_000 ms.
+    const { fetcher, calls } = countingFetcher(() => sub(1000, 800, 2000));
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: () => now,
+      stalenessTtl: 10_000_000, // large, so only the reset (not staleness) fires
+    });
+
+    await pool.acquire(200); // seeds a: remaining 200, holds 200 -> 0 available
+    now = 2_000_001; // billing period has rolled over
+
+    // Local reset snaps remaining back to full 1000 with no extra fetch.
+    expect((await pool.acquire(1000)).key).toBe('key-a');
+    expect(calls['key-a']).toBe(1);
+  });
+
+  it('sync() warms snapshots explicitly, off the acquire path', async () => {
+    const { fetcher, calls } = countingFetcher(() => sub(1000));
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+    });
+
+    await pool.sync(); // seeds both up front
+    expect(calls['key-a']).toBe(1);
+    expect(calls['key-b']).toBe(1);
+
+    await pool.acquire(100); // served from the warm snapshot, no extra fetch
+    expect(calls['key-a']).toBe(1);
+  });
+
+  it('keeps the last-known snapshot and retries with backoff when a Sync fails', async () => {
+    let now = 1_000_000;
+    // Succeeds on the seed, then always fails (network/5xx).
+    const { fetcher, calls } = countingFetcher((_key, call) => {
+      if (call === 1) return sub(1000, 0);
+      throw new Error('network down');
+    });
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: () => now,
+      stalenessTtl: 60_000,
+      syncRetries: 2,
+      sleep: noSleep,
+    });
+
+    await pool.acquire(100); // seed succeeds (call 1)
+    now += 60_001; // force a stale re-Sync that will fail
+
+    // Selection still succeeds on the last-known snapshot despite the failure.
+    expect((await pool.acquire(100)).key).toBe('key-a');
+    // 1 seed + (1 initial + 2 retries) for the failed Sync = 4 attempts.
+    expect(calls['key-a']).toBe(4);
+  });
+
+  it('skips an unseeded Account whose fetcher is down and waterfalls to a healthy one', async () => {
+    const { fetcher } = countingFetcher((key, call) => {
+      if (key === 'key-a') throw new Error(`a is down (attempt ${call})`);
+      return sub(1000);
+    });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+      syncRetries: 1,
+      sleep: noSleep,
+    });
+
+    // a can't be seeded, so selection falls through to the healthy b.
+    expect((await pool.acquire(100)).key).toBe('key-b');
   });
 });
 

@@ -15,5 +15,9 @@ export {
   Pool,
   DEFAULT_FALLBACK_BLOCK,
   DEFAULT_LEASE_TTL,
+  DEFAULT_STALENESS_TTL,
+  DEFAULT_NEAR_LIMIT_THRESHOLD,
+  DEFAULT_SYNC_RETRIES,
+  DEFAULT_SYNC_BACKOFF,
 } from './pool.js';
 export type { PoolConfig } from './pool.js';
