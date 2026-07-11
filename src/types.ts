@@ -83,6 +83,31 @@ export type SubscriptionFetcher = (key: string) => Promise<Subscription>;
 export type Clock = () => number;
 
 /**
+ * The result of a successful {@link Pool.acquire}: the selected Account's Key
+ * plus the two ways to close out the Reservation taken when it was acquired.
+ *
+ * `key` is a bare string ready to hand straight to an ElevenLabs client. The
+ * lease exists because the Reservation must be referenced to reconcile it, and
+ * a bare string can't carry that reference safely across concurrent callers —
+ * so `commit`/`release` are methods on the handle (see ADR-0002).
+ */
+export interface KeyLease {
+  /** The selected Account's API Key. */
+  readonly key: string;
+  /**
+   * Reconcile the Reservation to the exact Credits the Generation consumed —
+   * the caller reads this from ElevenLabs' `x-character-count` response header.
+   * Corrects the estimate whether the true cost was higher or lower.
+   */
+  commit(actualCredits: number): Promise<void>;
+  /**
+   * Refund the Reservation in full because the Generation failed and ElevenLabs
+   * charged nothing, restoring the Account's available Credits.
+   */
+  release(): Promise<void>;
+}
+
+/**
  * The storage seam behind the pool. It owns the atomic Credit operations, which
  * is what keeps selection correct under concurrency and across process
  * boundaries.

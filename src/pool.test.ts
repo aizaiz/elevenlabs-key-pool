@@ -32,7 +32,7 @@ function fakeFetcher(byKey: Record<string, Subscription>) {
 const fixedClock = () => 1_000_000;
 
 describe('createPool acquire()', () => {
-  it('returns the highest-Priority Account with room as a bare Key string', async () => {
+  it('returns the highest-Priority Account with room as a KeyLease', async () => {
     const { fetcher } = fakeFetcher({
       'key-a': sub(1000),
       'key-b': sub(1000),
@@ -46,10 +46,11 @@ describe('createPool acquire()', () => {
       clock: fixedClock,
     });
 
-    const key = await pool.acquire(100);
+    const lease = await pool.acquire(100);
 
-    expect(key).toBe('key-a');
-    expect(typeof key).toBe('string');
+    expect(lease.key).toBe('key-a');
+    expect(typeof lease.commit).toBe('function');
+    expect(typeof lease.release).toBe('function');
   });
 
   it('seeds each Account from the fetcher on first use, so a drained Account is skipped', async () => {
@@ -68,7 +69,7 @@ describe('createPool acquire()', () => {
     });
 
     // a has no remaining Credits once seeded, so selection falls through to b.
-    expect(await pool.acquire(500)).toBe('key-b');
+    expect((await pool.acquire(500)).key).toBe('key-b');
   });
 
   it('drains a higher-Priority Account to its Quota before selecting the next (waterfall)', async () => {
@@ -86,9 +87,9 @@ describe('createPool acquire()', () => {
     });
 
     // First acquire reserves all of a's Credits.
-    expect(await pool.acquire(1000)).toBe('key-a');
+    expect((await pool.acquire(1000)).key).toBe('key-a');
     // a is now held to 0 available, so the next acquire waterfalls to b.
-    expect(await pool.acquire(1)).toBe('key-b');
+    expect((await pool.acquire(1)).key).toBe('key-b');
   });
 
   it('reserves the configured fallback block when no estimate is given', async () => {
@@ -107,8 +108,8 @@ describe('createPool acquire()', () => {
     });
 
     // a fits exactly one fallback block; the second estimate-less acquire waterfalls.
-    expect(await pool.acquire()).toBe('key-a');
-    expect(await pool.acquire()).toBe('key-b');
+    expect((await pool.acquire()).key).toBe('key-a');
+    expect((await pool.acquire()).key).toBe('key-b');
   });
 
   it('never lets two overlapping acquires double-spend the same near-full Account', async () => {
@@ -128,7 +129,7 @@ describe('createPool acquire()', () => {
     // Two overlapping 600-Credit acquires against a's 1000: only one fits a.
     const [first, second] = await Promise.all([pool.acquire(600), pool.acquire(600)]);
 
-    expect([first, second].sort()).toEqual(['key-a', 'key-b']);
+    expect([first.key, second.key].sort()).toEqual(['key-a', 'key-b']);
   });
 
   it('does not re-Sync an already-seeded Account on every acquire', async () => {
@@ -171,5 +172,79 @@ describe('createPool acquire()', () => {
         clock: fixedClock,
       }),
     ).toThrow(/duplicate/i);
+  });
+});
+
+describe('createPool commit() / release()', () => {
+  it('debits the actual Credits on commit, not the estimate, when actual is lower', async () => {
+    const { fetcher } = fakeFetcher({ 'key-a': sub(1000), 'key-b': sub(1000) });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+    });
+
+    const lease = await pool.acquire(1000); // holds all of a's Credits
+    await lease.commit(300); // the Generation actually cost 300
+
+    // a's remaining is now 700 (not 0): the estimate's hold was reconciled down.
+    expect((await pool.acquire(700)).key).toBe('key-a');
+  });
+
+  it('debits the actual Credits on commit when actual exceeds the estimate', async () => {
+    const { fetcher } = fakeFetcher({ 'key-a': sub(1000), 'key-b': sub(1000) });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+    });
+
+    const lease = await pool.acquire(300); // holds 300
+    await lease.commit(400); // the Generation actually cost 400
+
+    // a's remaining is now 600, so a 700-Credit acquire waterfalls to b —
+    // proving the true 400 was debited, not the 300 estimate.
+    expect((await pool.acquire(700)).key).toBe('key-b');
+  });
+
+  it('refunds a Reservation in full on release, restoring availability', async () => {
+    const { fetcher } = fakeFetcher({ 'key-a': sub(1000) });
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: fixedClock,
+    });
+
+    const lease = await pool.acquire(1000); // holds all of a's Credits
+    await lease.release(); // the Generation failed; ElevenLabs charged nothing
+
+    // The full 1000 is available again.
+    expect((await pool.acquire(1000)).key).toBe('key-a');
+  });
+
+  it('computes availability as remaining minus committed minus live Reservations', async () => {
+    const { fetcher } = fakeFetcher({ 'key-a': sub(1000), 'key-b': sub(1000) });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+    });
+
+    const first = await pool.acquire(200);
+    await first.commit(150); // a's remaining: 1000 - 150 = 850
+    await pool.acquire(300); // a live Reservation of 300 -> available 550
+
+    // 550 fits a exactly; the next Credit waterfalls to b.
+    expect((await pool.acquire(550)).key).toBe('key-a');
+    expect((await pool.acquire(1)).key).toBe('key-b');
   });
 });

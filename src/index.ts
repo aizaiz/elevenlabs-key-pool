@@ -2,6 +2,7 @@ export type {
   AccountConfig,
   AccountSnapshot,
   Clock,
+  KeyLease,
   Reservation,
   StorageAdapter,
   Subscription,

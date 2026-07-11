@@ -3,6 +3,7 @@ import type {
   AccountConfig,
   AccountSnapshot,
   Clock,
+  KeyLease,
   StorageAdapter,
   Subscription,
   SubscriptionFetcher,
@@ -85,22 +86,33 @@ export class Pool {
    *
    * @param estimatedCredits Credits the Generation is expected to consume. When
    *   omitted, the configured fallback block is reserved instead.
-   * @returns the selected Account's bare Key string.
+   * @returns a {@link KeyLease} carrying the selected Account's Key and the
+   *   `commit`/`release` handles for its Reservation.
    * @throws if no Account has room for the reservation.
    */
-  async acquire(estimatedCredits?: number): Promise<string> {
+  async acquire(estimatedCredits?: number): Promise<KeyLease> {
     const credits = estimatedCredits ?? this.#fallbackBlock;
 
     for (const account of this.#accounts) {
       await this.#ensureSeeded(account);
       const reservation = await this.#storage.reserve(account.id, credits);
       if (reservation) {
-        return account.key;
+        return this.#lease(account.key, reservation.id);
       }
     }
 
     // Typed exhaustion + optional overflow Account are a later concern (#7).
     throw new Error('No Account has enough Credits available to acquire a Key.');
+  }
+
+  /** Wrap a Reservation as a {@link KeyLease} bound to its commit/release. */
+  #lease(key: string, reservationId: string): KeyLease {
+    const storage = this.#storage;
+    return {
+      key,
+      commit: (actualCredits) => storage.commit(reservationId, actualCredits),
+      release: () => storage.release(reservationId),
+    };
   }
 
   /**
