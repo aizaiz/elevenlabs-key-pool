@@ -1,4 +1,5 @@
 import { InMemoryStorageAdapter } from './adapters/memory.js';
+import { AllAccountsExhausted } from './errors.js';
 import type {
   AccountConfig,
   AccountSnapshot,
@@ -103,6 +104,13 @@ export interface PoolConfig {
    * backoff without real delays. Defaults to a `setTimeout`-based sleep.
    */
   readonly sleep?: (ms: number) => Promise<void>;
+  /**
+   * Id of an Account permitted to run into Overage once every other Account is
+   * exhausted — an explicit opt-in to completion-at-a-cost. Held out of the
+   * normal waterfall and used only as a last resort; omit to make exhaustion
+   * throw {@link AllAccountsExhausted} instead. Must name a registered Account.
+   */
+  readonly overflowAccountId?: string;
 }
 
 /**
@@ -125,6 +133,7 @@ export class Pool {
   readonly #syncRetries: number;
   readonly #syncBackoff: number;
   readonly #sleep: (ms: number) => Promise<void>;
+  readonly #overflowAccountId: string | undefined;
 
   /** Accounts by id, for {@link Pool.sync} of a single Account. */
   readonly #accountsById = new Map<string, AccountConfig>();
@@ -172,6 +181,11 @@ export class Pool {
     this.#syncRetries = config.syncRetries ?? DEFAULT_SYNC_RETRIES;
     this.#syncBackoff = config.syncBackoff ?? DEFAULT_SYNC_BACKOFF;
     this.#sleep = config.sleep ?? defaultSleep;
+
+    if (config.overflowAccountId !== undefined && !this.#accountsById.has(config.overflowAccountId)) {
+      throw new Error(`Unknown overflow Account id: ${config.overflowAccountId}`);
+    }
+    this.#overflowAccountId = config.overflowAccountId;
   }
 
   /**
@@ -183,12 +197,18 @@ export class Pool {
    *   omitted, the configured fallback block is reserved instead.
    * @returns a {@link KeyLease} carrying the selected Account's Key and the
    *   `commit`/`release` handles for its Reservation.
-   * @throws if no Account has room for the reservation.
+   * @throws {@link AllAccountsExhausted} when no Account has room and no
+   *   overflow Account is configured.
    */
   async acquire(estimatedCredits?: number): Promise<KeyLease> {
     const credits = estimatedCredits ?? this.#fallbackBlock;
 
     for (const account of this.#accounts) {
+      // The overflow Account is held out of the normal waterfall and used only
+      // as a last resort (below), so prepaid Credits are spent first.
+      if (account.id === this.#overflowAccountId) {
+        continue;
+      }
       // Refresh drift before selecting: seed on first use, apply a due Quota
       // reset, and lazily/forcibly Sync. A failed refresh keeps the last-known
       // snapshot; only an unseeded Account with a down fetcher is skipped.
@@ -202,8 +222,25 @@ export class Pool {
       }
     }
 
-    // Typed exhaustion + optional overflow Account are a later concern (#7).
-    throw new Error('No Account has enough Credits available to acquire a Key.');
+    // Every non-overflow Account is exhausted. Fall back to the overflow
+    // Account if one is configured, letting it run into Overage.
+    if (this.#overflowAccountId !== undefined) {
+      const overflow = this.#accountsById.get(this.#overflowAccountId)!;
+      const snapshot = await this.#ensureFresh(overflow);
+      if (snapshot) {
+        const reservation = await this.#storage.reserve(
+          overflow.id,
+          credits,
+          this.#leaseTtl,
+          true, // allow Overage: the overflow Account's explicit opt-in
+        );
+        if (reservation) {
+          return this.#lease(overflow.key, reservation.id);
+        }
+      }
+    }
+
+    throw new AllAccountsExhausted(this.#accounts.map((account) => account.id));
   }
 
   /**

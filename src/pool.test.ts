@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createPool } from './pool.js';
+import { AllAccountsExhausted } from './errors.js';
 import type { Subscription, SubscriptionFetcher } from './types.js';
 
 /** A Subscription with `limit` Credits, `used` already spent, and a reset time. */
@@ -328,6 +329,74 @@ describe('createPool sync & drift correction', () => {
 
     // a can't be seeded, so selection falls through to the healthy b.
     expect((await pool.acquire(100)).key).toBe('key-b');
+  });
+});
+
+describe('createPool exhaustion & overflow', () => {
+  it('throws a typed AllAccountsExhausted when no Account has room and no overflow', async () => {
+    const { fetcher } = fakeFetcher({ 'key-a': sub(100) });
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: fixedClock,
+    });
+
+    await expect(pool.acquire(200)).rejects.toBeInstanceOf(AllAccountsExhausted);
+  });
+
+  it('returns the overflow Account once all others are exhausted, even into Overage', async () => {
+    const { fetcher } = fakeFetcher({ 'key-a': sub(100), 'key-b': sub(100) });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: fixedClock,
+      overflowAccountId: 'b',
+    });
+
+    expect((await pool.acquire(100)).key).toBe('key-a'); // drains a
+    expect((await pool.acquire(100)).key).toBe('key-b'); // overflow, b now at 0
+    // b has no room left, but as the overflow Account it's still handed out.
+    expect((await pool.acquire(100)).key).toBe('key-b');
+  });
+
+  it('uses the overflow Account only after every non-overflow Account is exhausted', async () => {
+    // b is the overflow Account and has the most room, but it's held last.
+    const { fetcher } = fakeFetcher({
+      'key-a': sub(100),
+      'key-b': sub(1000),
+      'key-c': sub(100),
+    });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+        { id: 'c', key: 'key-c', priority: 3 },
+      ],
+      fetcher,
+      clock: fixedClock,
+      overflowAccountId: 'b',
+    });
+
+    expect((await pool.acquire(100)).key).toBe('key-a');
+    // Skips overflow b despite its room; waterfalls to c.
+    expect((await pool.acquire(100)).key).toBe('key-c');
+    // a and c now exhausted, so the overflow Account is finally used.
+    expect((await pool.acquire(100)).key).toBe('key-b');
+  });
+
+  it('rejects a pool whose overflowAccountId names no registered Account', () => {
+    const { fetcher } = fakeFetcher({ 'key-a': sub(100) });
+    expect(() =>
+      createPool({
+        accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+        fetcher,
+        clock: fixedClock,
+        overflowAccountId: 'nope',
+      }),
+    ).toThrow(/overflow/i);
   });
 });
 

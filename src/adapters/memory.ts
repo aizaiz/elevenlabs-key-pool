@@ -46,14 +46,16 @@ export class InMemoryStorageAdapter implements StorageAdapter {
     accountId: string,
     credits: number,
     leaseMs?: number,
+    allowOverage = false,
   ): Promise<Reservation | null> {
     if (credits < 0) {
       throw new Error(`Cannot reserve a negative number of Credits: ${credits}`);
     }
     // Synchronous from here to the return: atomic with respect to other reserves.
     // #availableCredits prunes any expired leases first, so their held Credits
-    // are freed before this hold is measured.
-    if (this.#availableCredits(accountId) < credits) {
+    // are freed before this hold is measured. An overflow hold skips the gate
+    // and is allowed to drive the Account into Overage.
+    if (!allowOverage && this.#availableCredits(accountId) < credits) {
       return null;
     }
     const expiresAt = leaseMs === undefined ? Infinity : this.#clock() + leaseMs;

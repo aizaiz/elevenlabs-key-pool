@@ -145,11 +145,16 @@ export interface StorageAdapter {
    * @param leaseMs Lifetime of the hold in milliseconds. After it elapses the
    *   Reservation is auto-released on the next access/Sync of its Account.
    *   Omit for a hold that never expires.
+   * @param allowOverage When `true`, skip the availability check and hold the
+   *   Credits even if the Account has fewer than `credits` left — driving it
+   *   into Overage. Used only for a configured overflow Account; never resolves
+   *   to `null`. Defaults to `false`.
    */
   reserve(
     accountId: string,
     credits: number,
     leaseMs?: number,
+    allowOverage?: boolean,
   ): Promise<Reservation | null>;
 
   /**
