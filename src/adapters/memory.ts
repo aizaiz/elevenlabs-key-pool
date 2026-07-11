@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import type { AccountSnapshot, Reservation, StorageAdapter } from '../types.js';
+import type { AccountSnapshot, Clock, Reservation, StorageAdapter } from '../types.js';
+
+/** Construction options for {@link InMemoryStorageAdapter}. */
+export interface InMemoryStorageAdapterOptions {
+  /**
+   * Current time as Unix milliseconds, used to expire Reservation leases.
+   * Inject the same {@link Clock} the pool uses so expiry is deterministic in
+   * tests. Defaults to {@link Date.now}.
+   */
+  readonly clock?: Clock;
+}
 
 /**
  * The default {@link StorageAdapter}: holds all state in process memory.
@@ -14,6 +24,11 @@ import type { AccountSnapshot, Reservation, StorageAdapter } from '../types.js';
 export class InMemoryStorageAdapter implements StorageAdapter {
   readonly #snapshots = new Map<string, AccountSnapshot>();
   readonly #reservations = new Map<string, Reservation>();
+  readonly #clock: Clock;
+
+  constructor(options: InMemoryStorageAdapterOptions = {}) {
+    this.#clock = options.clock ?? Date.now;
+  }
 
   async writeSnapshot(accountId: string, snapshot: AccountSnapshot): Promise<void> {
     this.#snapshots.set(accountId, snapshot);
@@ -27,15 +42,22 @@ export class InMemoryStorageAdapter implements StorageAdapter {
     return this.#availableCredits(accountId);
   }
 
-  async reserve(accountId: string, credits: number): Promise<Reservation | null> {
+  async reserve(
+    accountId: string,
+    credits: number,
+    leaseMs?: number,
+  ): Promise<Reservation | null> {
     if (credits < 0) {
       throw new Error(`Cannot reserve a negative number of Credits: ${credits}`);
     }
     // Synchronous from here to the return: atomic with respect to other reserves.
+    // #availableCredits prunes any expired leases first, so their held Credits
+    // are freed before this hold is measured.
     if (this.#availableCredits(accountId) < credits) {
       return null;
     }
-    const reservation: Reservation = { id: randomUUID(), accountId, credits };
+    const expiresAt = leaseMs === undefined ? Infinity : this.#clock() + leaseMs;
+    const reservation: Reservation = { id: randomUUID(), accountId, credits, expiresAt };
     this.#reservations.set(reservation.id, reservation);
     return reservation;
   }
@@ -65,6 +87,7 @@ export class InMemoryStorageAdapter implements StorageAdapter {
 
   /** `remaining` minus the sum of this Account's outstanding Reservations. */
   #availableCredits(accountId: string): number {
+    this.#pruneExpired(accountId);
     const snapshot = this.#snapshots.get(accountId);
     if (!snapshot) {
       return 0;
@@ -76,6 +99,21 @@ export class InMemoryStorageAdapter implements StorageAdapter {
       }
     }
     return snapshot.remaining - reserved;
+  }
+
+  /**
+   * Drop this Account's Reservations whose lease has elapsed — the auto-release
+   * that stops an orphaned hold (e.g. a caller that crashed before commit or
+   * release) from permanently shrinking availability. Reservations committed or
+   * released before their lease elapsed are already gone, so are untouched.
+   */
+  #pruneExpired(accountId: string): void {
+    const now = this.#clock();
+    for (const [id, reservation] of this.#reservations) {
+      if (reservation.accountId === accountId && reservation.expiresAt <= now) {
+        this.#reservations.delete(id);
+      }
+    }
   }
 
   #requireReservation(reservationId: string): Reservation {

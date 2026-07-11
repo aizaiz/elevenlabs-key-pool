@@ -151,4 +151,55 @@ describe('InMemoryStorageAdapter', () => {
     await expect(adapter.commit('missing', 100)).rejects.toThrow();
     await expect(adapter.release('missing')).rejects.toThrow();
   });
+
+  describe('lease expiry', () => {
+    it('auto-releases an expired Reservation, restoring available Credits', async () => {
+      let now = 1000;
+      const adapter = new InMemoryStorageAdapter({ clock: () => now });
+      await adapter.writeSnapshot('acct-a', snapshotWith(1000));
+
+      await adapter.reserve('acct-a', 300, 5000); // leases until now + 5000
+      expect(await adapter.getAvailableCredits('acct-a')).toBe(700);
+
+      now += 5001; // advance past the lease
+      expect(await adapter.getAvailableCredits('acct-a')).toBe(1000);
+    });
+
+    it('lets a fresh Reservation take the Credits an expired one freed', async () => {
+      let now = 1000;
+      const adapter = new InMemoryStorageAdapter({ clock: () => now });
+      await adapter.writeSnapshot('acct-a', snapshotWith(1000));
+
+      await adapter.reserve('acct-a', 1000, 5000); // holds everything
+      now += 5001;
+
+      // The expired hold is pruned before this reserve is measured, so it fits.
+      expect(await adapter.reserve('acct-a', 1000, 5000)).not.toBeNull();
+    });
+
+    it('never expires a Reservation taken without a lease', async () => {
+      let now = 1000;
+      const adapter = new InMemoryStorageAdapter({ clock: () => now });
+      await adapter.writeSnapshot('acct-a', snapshotWith(1000));
+
+      await adapter.reserve('acct-a', 300); // no leaseMs -> never expires
+      now += 1_000_000_000;
+
+      expect(await adapter.getAvailableCredits('acct-a')).toBe(700);
+    });
+
+    it('leaves a Reservation committed before its lease elapsed unaffected by expiry', async () => {
+      let now = 1000;
+      const adapter = new InMemoryStorageAdapter({ clock: () => now });
+      await adapter.writeSnapshot('acct-a', snapshotWith(1000));
+
+      const reservation = await adapter.reserve('acct-a', 300, 5000);
+      await adapter.commit(reservation!.id, 300); // committed before expiry
+      now += 5001; // lease would have elapsed, but it's already reconciled
+
+      // remaining reflects the committed 300, not a double-count or a refund.
+      expect(await remainingOf(adapter, 'acct-a')).toBe(700);
+      expect(await adapter.getAvailableCredits('acct-a')).toBe(700);
+    });
+  });
 });

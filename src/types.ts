@@ -46,6 +46,13 @@ export interface Reservation {
   readonly accountId: string;
   /** Credits held. */
   readonly credits: number;
+  /**
+   * Unix milliseconds after which the lease has expired and the Reservation is
+   * auto-released on the next access/Sync of its Account, so a caller that
+   * crashed between {@link Pool.acquire} and commit/release can't permanently
+   * shrink availability. `Infinity` when no lease was requested (never expires).
+   */
+  readonly expiresAt: number;
 }
 
 /**
@@ -134,8 +141,16 @@ export interface StorageAdapter {
    * Atomically hold `credits` against an Account. Resolves to the Reservation,
    * or `null` if the Account has fewer than `credits` available — leaving the
    * balance untouched (no partial effect).
+   *
+   * @param leaseMs Lifetime of the hold in milliseconds. After it elapses the
+   *   Reservation is auto-released on the next access/Sync of its Account.
+   *   Omit for a hold that never expires.
    */
-  reserve(accountId: string, credits: number): Promise<Reservation | null>;
+  reserve(
+    accountId: string,
+    credits: number,
+    leaseMs?: number,
+  ): Promise<Reservation | null>;
 
   /**
    * Reconcile a Reservation to the actual Credits a Generation consumed: debit

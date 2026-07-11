@@ -175,6 +175,48 @@ describe('createPool acquire()', () => {
   });
 });
 
+describe('createPool lease expiry', () => {
+  it('auto-releases an orphaned Reservation once its lease elapses', async () => {
+    let now = 1_000_000;
+    const { fetcher } = fakeFetcher({ 'key-a': sub(1000) });
+    const pool = createPool({
+      accounts: [{ id: 'a', key: 'key-a', priority: 1 }],
+      fetcher,
+      clock: () => now,
+      leaseTtl: 30_000,
+    });
+
+    // Acquire holds all of a's Credits, then the caller "crashes" — no
+    // commit, no release.
+    await pool.acquire(1000);
+    now += 30_001; // advance past the lease TTL
+
+    // The orphaned hold is auto-released on the next acquire, so a fresh
+    // 1000-Credit acquire succeeds on the same Account.
+    expect((await pool.acquire(1000)).key).toBe('key-a');
+  });
+
+  it('does not release a Reservation before its lease elapses', async () => {
+    let now = 1_000_000;
+    const { fetcher } = fakeFetcher({ 'key-a': sub(1000), 'key-b': sub(1000) });
+    const pool = createPool({
+      accounts: [
+        { id: 'a', key: 'key-a', priority: 1 },
+        { id: 'b', key: 'key-b', priority: 2 },
+      ],
+      fetcher,
+      clock: () => now,
+      leaseTtl: 30_000,
+    });
+
+    await pool.acquire(1000); // holds all of a
+    now += 29_999; // still within the lease
+
+    // a is still fully held, so this acquire waterfalls to b.
+    expect((await pool.acquire(1)).key).toBe('key-b');
+  });
+});
+
 describe('createPool commit() / release()', () => {
   it('debits the actual Credits on commit, not the estimate, when actual is lower', async () => {
     const { fetcher } = fakeFetcher({ 'key-a': sub(1000), 'key-b': sub(1000) });

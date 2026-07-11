@@ -16,6 +16,15 @@ import type {
  */
 export const DEFAULT_FALLBACK_BLOCK = 1000;
 
+/**
+ * Lifetime of a Reservation's lease when {@link PoolConfig.leaseTtl} is unset.
+ * A Reservation neither committed nor released within this window is
+ * auto-released on the next access/Sync of its Account, so a caller that
+ * crashed between {@link Pool.acquire} and commit/release (common in
+ * serverless) doesn't permanently shrink availability. 60s by default.
+ */
+export const DEFAULT_LEASE_TTL = 60_000;
+
 /** Everything needed to construct a {@link Pool}. */
 export interface PoolConfig {
   /** The Accounts to spread usage across. At least one is required. */
@@ -35,6 +44,11 @@ export interface PoolConfig {
    * Defaults to {@link DEFAULT_FALLBACK_BLOCK}.
    */
   readonly fallbackBlock?: number;
+  /**
+   * Milliseconds a Reservation's lease survives before it is auto-released on
+   * the next access/Sync of its Account. Defaults to {@link DEFAULT_LEASE_TTL}.
+   */
+  readonly leaseTtl?: number;
 }
 
 /**
@@ -51,6 +65,7 @@ export class Pool {
   readonly #clock: Clock;
   readonly #storage: StorageAdapter;
   readonly #fallbackBlock: number;
+  readonly #leaseTtl: number;
 
   /**
    * In-flight seeds, keyed by Account id, so concurrent cold-start acquires
@@ -75,8 +90,11 @@ export class Pool {
     this.#accounts = [...config.accounts].sort((a, b) => a.priority - b.priority);
     this.#fetcher = config.fetcher ?? defaultFetcher;
     this.#clock = config.clock ?? Date.now;
-    this.#storage = config.storage ?? new InMemoryStorageAdapter();
+    // Share the pool's clock with the default adapter so lease expiry advances
+    // with the same injected time source (deterministic in tests).
+    this.#storage = config.storage ?? new InMemoryStorageAdapter({ clock: this.#clock });
     this.#fallbackBlock = config.fallbackBlock ?? DEFAULT_FALLBACK_BLOCK;
+    this.#leaseTtl = config.leaseTtl ?? DEFAULT_LEASE_TTL;
   }
 
   /**
@@ -95,7 +113,7 @@ export class Pool {
 
     for (const account of this.#accounts) {
       await this.#ensureSeeded(account);
-      const reservation = await this.#storage.reserve(account.id, credits);
+      const reservation = await this.#storage.reserve(account.id, credits, this.#leaseTtl);
       if (reservation) {
         return this.#lease(account.key, reservation.id);
       }

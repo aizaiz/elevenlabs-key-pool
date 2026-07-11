@@ -9,5 +9,11 @@ export type {
   SubscriptionFetcher,
 } from './types.js';
 export { InMemoryStorageAdapter } from './adapters/memory.js';
-export { createPool, Pool, DEFAULT_FALLBACK_BLOCK } from './pool.js';
+export type { InMemoryStorageAdapterOptions } from './adapters/memory.js';
+export {
+  createPool,
+  Pool,
+  DEFAULT_FALLBACK_BLOCK,
+  DEFAULT_LEASE_TTL,
+} from './pool.js';
 export type { PoolConfig } from './pool.js';
